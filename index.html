@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  >
+  <title>ROACH SMASH! — Touch Edition</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #171324;
+      font-family: Arial, sans-serif;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      display: block;
+      width: min(100vw, 177.777vh);
+      height: min(100vh, 56.25vw);
+      background: #1c162e;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #feedback-controls {
+      position: fixed;
+      left: 10px;
+      bottom: 10px;
+      z-index: 2;
+      display: flex;
+      gap: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: #171324;
+      color: white;
+      font-size: 14px;
+    }
+
+    #feedback-controls label {
+      white-space: nowrap;
+    }
+
+    #feedback-controls input {
+      width: 18px;
+      height: 18px;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas
+    id="game"
+    width="960"
+    height="540"
+    aria-label="ROACH SMASH touchscreen game"
+  ></canvas>
+
+  <div id="feedback-controls">
+    <label>
+      <input id="sound-enabled" type="checkbox" checked>
+      Hit sound
+    </label>
+    <label>
+      <input id="vibration-enabled" type="checkbox" checked>
+      Vibration
+    </label>
+  </div>
+
+  <script>
+    "use strict";
+
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const soundEnabled = document.getElementById("sound-enabled");
+    const vibrationEnabled = document.getElementById("vibration-enabled");
+
+    const W = 960;
+    const H = 540;
+    const TOP = 100;
+    const BOTTOM = 485;
+
+    const ROUND_SECONDS = 60;
+    const STARTING_LIVES = 3;
+    const SPAWN_INTERVAL = 1.4;
+    const MAX_ROACHES = 7;
+
+    const ROACH_RADIUS = 24;
+    const TOUCH_RADIUS = 14;
+
+    // Speed is measured in logical canvas pixels per second.
+    const MIN_SPEED = 850;
+    const MAX_SAMPLE_GAP_MS = 150;
+    const HIT_COOLDOWN_MS = 300;
+    const SPLAT_DURATION_MS = 450;
+
+    const button = {
+      x: 335,
+      y: 335,
+      w: 290,
+      h: 70
+    };
+
+    const C = {
+      background: "#1c162e",
+      play: "#2b253d",
+      white: "#f5f5f5",
+      yellow: "#ffda4b",
+      green: "#64ff82",
+      red: "#ff6973",
+      brown: "#b55c37",
+      dark: "#321a1d",
+      button: "#538a61"
+    };
+
+    let audioContext = null;
+
+    function prepareAudio() {
+      if (!soundEnabled.checked) return;
+
+      try {
+        const AudioContextClass =
+          window.AudioContext || window.webkitAudioContext;
+
+        if (!AudioContextClass) return;
+
+        if (audioContext === null) {
+          audioContext = new AudioContextClass();
+        }
+
+        // Calling resume during a tap helps satisfy mobile-browser
+        // audio playback restrictions.
+        if (audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+      } catch (_) {
+        // Audio is optional; never prevent gameplay.
+      }
+    }
+
+    function hitFeedback(golden) {
+      if (
+        vibrationEnabled.checked &&
+        typeof navigator.vibrate === "function"
+      ) {
+        try {
+          navigator.vibrate(golden ? [60, 40, 80] : 90);
+        } catch (_) {
+          // Device/browser vibration is optional.
+        }
+      }
+
+      if (!soundEnabled.checked) return;
+
+      try {
+        prepareAudio();
+
+        if (audioContext === null || audioContext.state !== "running") {
+          return;
+        }
+
+        const oscillator = audioContext.createOscillator();
+        const volume = audioContext.createGain();
+        const start = audioContext.currentTime;
+
+        oscillator.type = "triangle";
+        oscillator.frequency.setValueAtTime(
+          golden ? 550 : 320,
+          start
+        );
+        oscillator.frequency.exponentialRampToValueAtTime(
+          golden ? 220 : 110,
+          start + 0.12
+        );
+
+        volume.gain.setValueAtTime(0.12, start);
+        volume.gain.exponentialRampToValueAtTime(
+          0.001,
+          start + 0.15
+        );
+
+        oscillator.connect(volume);
+        volume.connect(audioContext.destination);
+
+        oscillator.start(start);
+        oscillator.stop(start + 0.15);
+      } catch (_) {
+        // The game still works if sound is unavailable.
+      }
+    }
+
+    function loadHighScore() {
+      try {
+        const value = Number(
+          localStorage.getItem("roachSmashHighScore")
+        );
+
+        return Number.isFinite(value) && value >= 0 ? value : 0;
+      } catch (_) {
+        return 0;
+      }
+    }
+
+    function saveHighScore(value) {
+      try {
+        localStorage.setItem(
+          "roachSmashHighScore",
+          String(value)
+        );
+      } catch (_) {
+        // Storage may be disabled; gameplay can continue.
+      }
+    }
+
+    let highScore = loadHighScore();
+
+    let state = "start";
+    let score = 0;
+    let lives = STARTING_LIVES;
+    let eliminated = 0;
+    let secondsLeft = ROUND_SECONDS;
+    let spawnClock = 0;
+    let roaches = [];
+    let splats = [];
+
+    let activePointer = null;
+    let pointer = null;
+    let previous = null;
+    let previousTime = null;
+    let speed = 0;
+    let swingArmed = true;
+    let lastHit = -HIT_COOLDOWN_MS;
+    let feedback = null;
+
+    let lastFrame = performance.now();
+
+    function between(a, b) {
+      return a + Math.random() * (b - a);
+    }
+
+    function spawnRoach() {
+      const edge = Math.floor(Math.random() * 4);
+      const movementSpeed = between(75, 145);
+      const drift = between(-22, 22);
+      const golden = Math.random() < 0.15;
+
+      if (edge === 0) {
+        return {
+          x: -ROACH_RADIUS,
+          y: between(TOP + 40, BOTTOM - 40),
+          vx: movementSpeed,
+          vy: drift,
+          golden
+        };
+      }
+
+      if (edge === 1) {
+        return {
+          x: W + ROACH_RADIUS,
+          y: between(TOP + 40, BOTTOM - 40),
+          vx: -movementSpeed,
+          vy: drift,
+          golden
+        };
+      }
+
+      if (edge === 2) {
+        return {
+          x: between(60, W - 60),
+          y: TOP - ROACH_RADIUS,
+          vx: drift,
+          vy: movementSpeed,
+          golden
+        };
+      }
+
+      return {
+        x: between(60, W - 60),
+        y: BOTTOM + ROACH_RADIUS,
+        vx: drift,
+        vy: -movementSpeed,
+        golden
+      };
+    }
+
+    function startGame() {
+      state = "playing";
+      score = 0;
+      lives = STARTING_LIVES;
+      eliminated = 0;
+      secondsLeft = ROUND_SECONDS;
+      spawnClock = 0;
+      roaches = [spawnRoach()];
+      splats = [];
+      feedback = null;
+
+      previous = null;
+      previousTime = null;
+      speed = 0;
+      swingArmed = true;
+      lastHit = -HIT_COOLDOWN_MS;
+    }
+
+    function endGame() {
+      state = "gameover";
+
+      if (score > highScore) {
+        highScore = score;
+        saveHighScore(highScore);
+      }
+    }
+
+    function positionOf(event) {
+      const rect = canvas.getBoundingClientRect();
+
+      return {
+        x: (event.clientX - rect.left) * W / rect.width,
+        y: (event.clientY - rect.top) * H / rect.height
+      };
+    }
+
+    function inButton(p) {
+      return (
+        p.x >= button.x &&
+        p.x <= button.x + button.w &&
+        p.y >= button.y &&
+        p.y <= button.y + button.h
+      );
+    }
+
+    function distanceToSegment(p, a, b) {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lengthSquared = dx * dx + dy * dy;
+
+      if (lengthSquared === 0) {
+        return Math.hypot(p.x - a.x, p.y - a.y);
+      }
+
+      const t = Math.max(
+        0,
+        Math.min(
+          1,
+          (
+            (p.x - a.x) * dx +
+            (p.y - a.y) * dy
+          ) / lengthSquared
+        )
+      );
+
+      return Math.hypot(
+        p.x - (a.x + t * dx),
+        p.y - (a.y + t * dy)
+      );
+    }
+
+    function movePointer(p, now) {
+      pointer = p;
+
+      if (
+        state !== "playing" ||
+        previous === null ||
+        previousTime === null
+      ) {
+        previous = p;
+        previousTime = now;
+        return;
+      }
+
+      const elapsed = now - previousTime;
+
+      if (
+        elapsed <= 0 ||
+        elapsed > MAX_SAMPLE_GAP_MS
+      ) {
+        speed = 0;
+        swingArmed = true;
+        previous = p;
+        previousTime = now;
+        return;
+      }
+
+      speed =
+        Math.hypot(
+          p.x - previous.x,
+          p.y - previous.y
+        ) / (elapsed / 1000);
+
+      if (speed < MIN_SPEED) {
+        swingArmed = true;
+      } else if (
+        swingArmed &&
+        now - lastHit >= HIT_COOLDOWN_MS
+      ) {
+        // Check the full swipe segment, not just whether the finger
+        // currently rests on a roach.
+        for (let i = 0; i < roaches.length; i++) {
+          const roach = roaches[i];
+
+          const distance = distanceToSegment(
+            roach,
+            previous,
+            p
+          );
+
+          if (distance <= ROACH_RADIUS + TOUCH_RADIUS) {
+            const points = roach.golden ? 30 : 10;
+
+            score += points;
+            eliminated += 1;
+            lastHit = now;
+            swingArmed = false;
+
+            splats.push({
+              x: roach.x,
+              y: roach.y,
+              golden: roach.golden,
+              start: now
+            });
+
+            feedback = {
+              text: `+${points} SMASH!`,
+              x: Math.max(20, Math.min(W - 250, roach.x)),
+              y: Math.max(
+                TOP + 35,
+                Math.min(BOTTOM - 20, roach.y)
+              ),
+              until: now + 550
+            };
+
+            roaches.splice(i, 1);
+
+            // Feedback happens only after a confirmed, scored hit.
+            hitFeedback(roach.golden);
+            break;
+          }
+        }
+      }
+
+      previous = p;
+      previousTime = now;
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+
+      if (activePointer !== null) return;
+
+      prepareAudio();
+
+      const p = positionOf(event);
+
+      if (state !== "playing" && inButton(p)) {
+        startGame();
+      }
+
+      activePointer = event.pointerId;
+      canvas.setPointerCapture(event.pointerId);
+
+      pointer = p;
+      previous = p;
+      previousTime = performance.now();
+      speed = 0;
+      swingArmed = true;
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (event.pointerId !== activePointer) return;
+
+      event.preventDefault();
+      movePointer(positionOf(event), performance.now());
+    });
+
+    function releasePointer(event) {
+      if (event.pointerId !== activePointer) return;
+
+      activePointer = null;
+      pointer = null;
+      previous = null;
+      previousTime = null;
+      speed = 0;
+      swingArmed = true;
+    }
+
+    canvas.addEventListener("pointerup", releasePointer);
+    canvas.addEventListener("pointercancel", releasePointer);
+    canvas.addEventListener("lostpointercapture", releasePointer);
+
+    window.addEventListener("keydown", (event) => {
+      if (
+        state !== "playing" &&
+        (event.key === "Enter" || event.key === " ")
+      ) {
+        event.preventDefault();
+        prepareAudio();
+        startGame();
+      }
+    });
+
+    function label(
+      message,
+      x,
+      y,
+      size,
+      color = C.white,
+      align = "left"
+    ) {
+      ctx.fillStyle = color;
+      ctx.textAlign = align;
+      ctx.font = `bold ${size}px Arial, sans-serif`;
+      ctx.fillText(message, x, y);
+    }
+
+    function drawButton(message) {
+      ctx.fillStyle = C.button;
+      ctx.fillRect(
+        button.x,
+        button.y,
+        button.w,
+        button.h
+      );
+
+      label(
+        message,
+        W / 2,
+        button.y + 47,
+        34,
+        C.white,
+        "center"
+      );
+    }
+
+    function drawRoach(roach) {
+      ctx.strokeStyle = C.dark;
+      ctx.lineWidth = 4;
+
+      for (const offset of [-12, 0, 12]) {
+        ctx.beginPath();
+        ctx.moveTo(
+          roach.x - 15,
+          roach.y + offset / 2
+        );
+        ctx.lineTo(
+          roach.x - 31,
+          roach.y + offset
+        );
+        ctx.moveTo(
+          roach.x + 15,
+          roach.y + offset / 2
+        );
+        ctx.lineTo(
+          roach.x + 31,
+          roach.y + offset
+        );
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = C.dark;
+      ctx.beginPath();
+      ctx.ellipse(
+        roach.x,
+        roach.y,
+        24,
+        22,
+        0,
+        0,
+        2 * Math.PI
+      );
+      ctx.fill();
+
+      ctx.fillStyle = roach.golden ? C.yellow : C.brown;
+      ctx.beginPath();
+      ctx.ellipse(
+        roach.x,
+        roach.y,
+        19,
+        19,
+        0,
+        0,
+        2 * Math.PI
+      );
+      ctx.fill();
+
+      ctx.fillStyle = C.white;
+      ctx.beginPath();
+      ctx.arc(
+        roach.x - 8,
+        roach.y - 7,
+        4,
+        0,
+        2 * Math.PI
+      );
+      ctx.arc(
+        roach.x + 8,
+        roach.y - 7,
+        4,
+        0,
+        2 * Math.PI
+      );
+      ctx.fill();
+    }
+
+    function drawSplat(splat, now) {
+      const progress =
+        (now - splat.start) / SPLAT_DURATION_MS;
+
+      if (progress < 0 || progress >= 1) return;
+
+      const color = splat.golden ? C.yellow : C.red;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(
+        1,
+        6 * (1 - progress)
+      );
+
+      ctx.beginPath();
+      ctx.arc(
+        splat.x,
+        splat.y,
+        20 + progress * 55,
+        0,
+        2 * Math.PI
+      );
+      ctx.stroke();
+
+      ctx.fillStyle = color;
+
+      for (let i = 0; i < 8; i++) {
+        const angle = i * Math.PI / 4;
+        const distance = 12 + progress * 35;
+
+        ctx.beginPath();
+        ctx.arc(
+          splat.x + Math.cos(angle) * distance,
+          splat.y + Math.sin(angle) * distance,
+          Math.max(1, 9 * (1 - progress)),
+          0,
+          2 * Math.PI
+        );
+        ctx.fill();
+      }
+    }
+
+    function update(dt, now) {
+      if (state !== "playing") return;
+
+      secondsLeft = Math.max(
+        0,
+        secondsLeft - dt
+      );
+      spawnClock += dt;
+
+      while (spawnClock >= SPAWN_INTERVAL) {
+        spawnClock -= SPAWN_INTERVAL;
+
+        if (roaches.length < MAX_ROACHES) {
+          roaches.push(spawnRoach());
+        }
+      }
+
+      for (let i = roaches.length - 1; i >= 0; i--) {
+        const roach = roaches[i];
+
+        roach.x += roach.vx * dt;
+        roach.y += roach.vy * dt;
+
+        const margin = ROACH_RADIUS + 12;
+
+        if (
+          roach.x < -margin ||
+          roach.x > W + margin ||
+          roach.y < TOP - margin ||
+          roach.y > BOTTOM + margin
+        ) {
+          roaches.splice(i, 1);
+          lives -= 1;
+        }
+      }
+
+      splats = splats.filter(
+        splat =>
+          now - splat.start < SPLAT_DURATION_MS
+      );
+
+      if (secondsLeft <= 0 || lives <= 0) {
+        endGame();
+      }
+    }
+
+    function draw(now) {
+      ctx.fillStyle = C.background;
+      ctx.fillRect(0, 0, W, H);
+
+      if (state === "start") {
+        label(
+          "ROACH SMASH!",
+          W / 2,
+          145,
+          60,
+          C.yellow,
+          "center"
+        );
+
+        label(
+          "Swipe quickly across roaches to smash them.",
+          W / 2,
+          225,
+          26,
+          C.white,
+          "center"
+        );
+
+        label(
+          "Hovering does not count. Escapes cost a life!",
+          W / 2,
+          265,
+          25,
+          C.white,
+          "center"
+        );
+
+        label(
+          `High score: ${highScore}`,
+          W / 2,
+          310,
+          24,
+          C.white,
+          "center"
+        );
+
+        drawButton("PLAY");
+
+        label(
+          "Touch PLAY to start",
+          W / 2,
+          450,
+          22,
+          C.white,
+          "center"
+        );
+
+      } else if (state === "playing") {
+        ctx.fillStyle = C.play;
+        ctx.fillRect(
+          0,
+          TOP,
+          W,
+          BOTTOM - TOP
+        );
+
+        label(
+          `Score ${score}`,
+          25,
+          66,
+          38,
+          C.yellow
+        );
+
+        label(
+          `${Math.ceil(secondsLeft)}s`,
+          W / 2,
+          66,
+          38,
+          C.white,
+          "center"
+        );
+
+        label(
+          `Lives ${lives}`,
+          W - 25,
+          66,
+          38,
+          C.red,
+          "right"
+        );
+
+        roaches.forEach(drawRoach);
+
+        splats.forEach(
+          splat => drawSplat(splat, now)
+        );
+
+        if (feedback && now < feedback.until) {
+          label(
+            feedback.text,
+            feedback.x,
+            feedback.y,
+            32,
+            C.yellow
+          );
+        }
+
+        if (pointer) {
+          ctx.strokeStyle = C.green;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(
+            pointer.x,
+            pointer.y,
+            TOUCH_RADIUS,
+            0,
+            2 * Math.PI
+          );
+          ctx.stroke();
+        }
+
+        label(
+          `Speed ${Math.round(speed)} px/s | ` +
+          (swingArmed ? "READY" : "SLOW DOWN"),
+          20,
+          H - 20,
+          20
+        );
+
+      } else {
+        label(
+          "GAME OVER!",
+          W / 2,
+          130,
+          60,
+          C.yellow,
+          "center"
+        );
+
+        label(
+          `Final score: ${score}`,
+          W / 2,
+          205,
+          38,
+          C.white,
+          "center"
+        );
+
+        label(
+          `Roaches eliminated: ${eliminated}`,
+          W / 2,
+          260,
+          26,
+          C.white,
+          "center"
+        );
+
+        label(
+          `High score: ${highScore}`,
+          W / 2,
+          300,
+          26,
+          C.white,
+          "center"
+        );
+
+        drawButton("PLAY AGAIN");
+      }
+    }
+
+    function frame(now) {
+      // Cap movement after changing tabs or temporarily losing focus.
+      const dt = Math.min(
+        (now - lastFrame) / 1000,
+        0.05
+      );
+
+      lastFrame = now;
+
+      update(dt, now);
+      draw(now);
+
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

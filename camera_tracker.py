@@ -1,10 +1,14 @@
-"""Standalone OpenCV test for a brightly coloured swatter marker.
+"""Standalone green-marker tracking test for Windows and macOS.
 
-This module detects a marker in camera coordinates. It does NOT perform
-four-point calibration or connect camera positions to game hits yet.
+Run:
+    python camera_tracker.py
+
+This reports positions in CAMERA pixels. It is not yet calibrated to
+the game window and does not control gameplay.
 """
 
 from dataclasses import dataclass
+import sys
 
 import cv2
 import numpy as np
@@ -34,43 +38,46 @@ class CameraTracker:
         self.missed_frames = 0
 
     def open(self):
-        self.camera = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        # DirectShow is Windows-only. AVFoundation is the macOS backend.
+        if sys.platform == "win32":
+            backend = cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_ANY
+
+        self.camera = cv2.VideoCapture(self.camera_index, backend)
 
         if not self.camera.isOpened():
             self.close()
             raise RuntimeError(
-                f"Cannot open camera {self.camera_index}. "
-                "Check that Windows receives live video first."
+                f"Cannot open camera index {self.camera_index}. "
+                "Check camera permissions, close other camera apps, "
+                "or try a different camera index."
             )
 
     def read_marker(self):
-        """Return (observation or None, annotated frame).
-
-        Raise RuntimeError if the camera stops supplying frames.
-        """
+        """Return (marker observation or None, annotated camera frame)."""
         if self.camera is None:
             raise RuntimeError("Call open() before read_marker().")
 
         success, frame = self.camera.read()
 
         if not success or frame is None:
-            raise RuntimeError("Camera did not supply a video frame.")
+            raise RuntimeError("Camera opened but supplied no video frame.")
 
         blurred = cv2.GaussianBlur(frame, (7, 7), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
         mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
         kernel = np.ones((5, 5), dtype=np.uint8)
-
-        mask = cv2.morphologyEx(
-            mask, cv2.MORPH_OPEN, kernel
-        )
-        mask = cv2.morphologyEx(
-            mask, cv2.MORPH_CLOSE, kernel
-        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
         )
 
         observation = None
@@ -89,7 +96,9 @@ class CameraTracker:
                     observation = MarkerObservation(x, y, area)
                     self.missed_frames = 0
 
-                    cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
+                    cv2.drawContours(
+                        frame, [contour], -1, (0, 255, 0), 2
+                    )
                     cv2.circle(frame, (x, y), 8, (0, 0, 255), -1)
 
         if observation is None:
@@ -121,26 +130,38 @@ class CameraTracker:
 
 
 def main():
+    # Change to 1 if index 0 is not the intended camera.
     tracker = CameraTracker(camera_index=0)
 
     try:
         tracker.open()
-        print("Camera open. Hold up a green marker. Press Q or Esc to quit.")
+        print("Camera open. Show a green marker. Press Q or Esc to quit.")
 
         while True:
-            _, frame = tracker.read_marker()
-            cv2.imshow("ROACH SMASH! - Marker Tracking Test", frame)
+            observation, frame = tracker.read_marker()
+
+            if observation is not None:
+                print(
+                    f"\rMarker: x={observation.x}, "
+                    f"y={observation.y}, "
+                    f"area={observation.area:.0f}    ",
+                    end="",
+                    flush=True,
+                )
+
+            cv2.imshow("ROACH SMASH! - Marker Test", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
 
     except RuntimeError as error:
-        print(f"Camera test unavailable: {error}")
+        print(f"\nCamera test failed: {error}")
 
     finally:
         tracker.close()
         cv2.destroyAllWindows()
+        print("\nCamera released.")
 
 
 if __name__ == "__main__":
